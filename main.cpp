@@ -44,6 +44,7 @@ struct Queue
 	VkQueue queue;
 	VkCommandPool cmdPool;
 	VkCommandBuffer cmdBuffer;
+	bool supportTimestamps;
 };
 
 
@@ -60,10 +61,13 @@ static VkInstance GVkInstance = VK_NULL_HANDLE;
 static VkPhysicalDevice GVkPhysDevice = VK_NULL_HANDLE;
 static VkDevice GVkDevice = VK_NULL_HANDLE;
 static int32_t GQueueFamilyIndices[kQueueTypesCount] = {-1, -1, -1};
+static bool GQueueFamilySupportTimestamp[kQueueTypesCount] = {};
+static float GTimestampPeriod = 0.0f;
 static std::vector<Queue> GQueues;
 static std::vector<GpuMemoryProps> GGpuMemory;
 static std::vector<CpuMemoryProps> GCpuMemory;
 static VkFence GFence;
+static VkQueryPool GQueryPool;
 static double GInvPerfFrequency = 0.0f;
 static const char* kQueueTypeStr[] = { "Graphics", "Compute", "Transfer" };
 
@@ -147,6 +151,7 @@ static void EnumerateQueues()
 			if ((famityProp.queueFlags & requiredQueueFlags[typeIdx]) == requiredQueueFlags[typeIdx])
 			{
 				GQueueFamilyIndices[typeIdx] = familyIndex;
+				GQueueFamilySupportTimestamp[typeIdx] = famityProp.timestampValidBits != 0 && typeIdx != kQueueTransfer;
 				ResetBit(freeFamiliesMask, familyIndex);
 			}
 		}
@@ -226,6 +231,8 @@ static bool InitQueue(EQueueType type)
 		return {};
 	}
 
+	queue.supportTimestamps = GQueueFamilySupportTimestamp[type];
+
 	GQueues.push_back(queue);
 	return true;
 }
@@ -276,6 +283,10 @@ static bool InitVulkan()
 	}
 	GVkPhysDevice = physicalDevices[0];
 
+	VkPhysicalDeviceProperties physDeviceProps = {};
+	vkGetPhysicalDeviceProperties(GVkPhysDevice, &physDeviceProps);
+	GTimestampPeriod = physDeviceProps.limits.timestampPeriod;
+
 	EnumerateQueues();
 
 	std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
@@ -324,6 +335,17 @@ static bool InitVulkan()
 	QueryPerformanceFrequency(&frequency);
 	GInvPerfFrequency = 1.0 / frequency.QuadPart;
 
+	VkQueryPoolCreateInfo queryPoolCreateInfo = {};
+	queryPoolCreateInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+	queryPoolCreateInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+	queryPoolCreateInfo.queryCount = 2;
+	result = vkCreateQueryPool(GVkDevice, &queryPoolCreateInfo, nullptr, &GQueryPool);
+	if (result != VK_SUCCESS)
+	{
+		LogStdErr("vkCreateQueryPool failed\n");
+		return {};
+	}
+
 	return true;
 }
 
@@ -337,6 +359,7 @@ static std::optional<Buffer> CreateBuffer(VkDeviceSize size, uint32_t memTypeInd
 	bufferCreateInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
 	Buffer buffer = {};
+	buffer.size = size;
 	VkResult result = vkCreateBuffer(GVkDevice, &bufferCreateInfo, nullptr, &buffer.buffer);
 	if (result != VK_SUCCESS)
 	{
@@ -392,17 +415,68 @@ static uint64_t GetCpuTimestamp()
 }
 
 
-static std::tuple<double, VkDeviceSize> Copy(const Queue& queue, const Buffer& dstBuffer, const Buffer& srcBuffer, VkDeviceSize size)
+static double SubmitAndMeasureTime(const Queue& queue)
+{
+	VkResult result = vkResetFences(GVkDevice, 1, &GFence);
+	if (result != VK_SUCCESS)
+	{
+		LogStdErr("vkResetFences failed\n");
+		return -1.0;
+	}
+
+	uint64_t cpuBeginTime = GetCpuTimestamp();
+	VkSubmitInfo submitInfo = {};
+	submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	submitInfo.commandBufferCount = 1;
+	submitInfo.pCommandBuffers = &queue.cmdBuffer;
+	result = vkQueueSubmit(queue.queue, 1, &submitInfo, GFence);
+	if (result != VK_SUCCESS)
+	{
+		LogStdErr("vkQueueSubmit failed\n");
+		return -1.0;
+	}
+
+	result = vkWaitForFences(GVkDevice, 1, &GFence, VK_TRUE, ~0llu);
+	if (result != VK_SUCCESS)
+	{
+		LogStdErr("vkWaitForFences failed\n");
+		return -1.0;
+	}
+
+	uint64_t cpuEndTime = GetCpuTimestamp();
+
+	double time = 0.0f;
+	if (queue.supportTimestamps)
+	{
+		uint64_t queryResult[2] = {};
+		result = vkGetQueryPoolResults(GVkDevice, GQueryPool, 0, 2, sizeof(queryResult), queryResult, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+		if (result != VK_SUCCESS)
+		{
+			LogStdErr("vkGetQueryPoolResults failed\n");
+			return -1.0;
+		}
+
+		time = (queryResult[1] - queryResult[0]) * GTimestampPeriod * 1e-09;
+	}
+	else
+	{
+		time = (cpuEndTime - cpuBeginTime) * GInvPerfFrequency;
+	}
+	return time;
+}
+
+
+static std::tuple<double, VkDeviceSize> Copy(const Queue& queue, const Buffer& dstBuffer, const Buffer& srcBuffer)
 {
 	VkBufferCopy bufferCopy = {};
 	if (dstBuffer.buffer != srcBuffer.buffer)
 	{
-		bufferCopy.size = size;
+		bufferCopy.size = dstBuffer.size;
 	}
 	else
 	{
-		bufferCopy.dstOffset = size / 2;
-		bufferCopy.size = size / 2;
+		bufferCopy.dstOffset = dstBuffer.size / 2;
+		bufferCopy.size = dstBuffer.size / 2;
 	}
 
 	VkCommandBufferBeginInfo beginInfo = {};
@@ -415,49 +489,69 @@ static std::tuple<double, VkDeviceSize> Copy(const Queue& queue, const Buffer& d
 		return { -1.0f, 0 };
 	}
 
+	if (queue.supportTimestamps)
+	{
+		vkCmdResetQueryPool(queue.cmdBuffer, GQueryPool, 0, 2);
+		vkCmdWriteTimestamp(queue.cmdBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, GQueryPool, 0);
+	}
+
 	vkCmdCopyBuffer(queue.cmdBuffer, srcBuffer.buffer, dstBuffer.buffer, 1, &bufferCopy);
+
+	if (queue.supportTimestamps)
+		vkCmdWriteTimestamp(queue.cmdBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, GQueryPool, 1);
+
 	result = vkEndCommandBuffer(queue.cmdBuffer);
+	if (result != VK_SUCCESS)
+	{
+		LogStdErr("vkEndCommandBuffer failed\n");
+		return { -1.0f, 0 };
+	}
+
+	double time = SubmitAndMeasureTime(queue);
+	return { time, bufferCopy.size };
+}
+
+
+static std::tuple<double, VkDeviceSize> Fill(const Queue& queue, const Buffer& dstBuffer)
+{
+	VkCommandBufferBeginInfo beginInfo = {};
+	beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	VkResult result = vkBeginCommandBuffer(queue.cmdBuffer, &beginInfo);
 	if (result != VK_SUCCESS)
 	{
 		LogStdErr("vkBeginCommandBuffer failed\n");
 		return { -1.0f, 0 };
 	}
 
-	result = vkResetFences(GVkDevice, 1, &GFence);
+	if (queue.supportTimestamps)
+	{
+		vkCmdResetQueryPool(queue.cmdBuffer, GQueryPool, 0, 2);
+		vkCmdWriteTimestamp(queue.cmdBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, GQueryPool, 0);
+	}
+
+	vkCmdFillBuffer(queue.cmdBuffer, dstBuffer.buffer, 0, dstBuffer.size, 0);
+
+	if (queue.supportTimestamps)
+		vkCmdWriteTimestamp(queue.cmdBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, GQueryPool, 1);
+
+	result = vkEndCommandBuffer(queue.cmdBuffer);
 	if (result != VK_SUCCESS)
 	{
-		LogStdErr("vkResetFences failed\n");
+		LogStdErr("vkEndCommandBuffer failed\n");
 		return { -1.0f, 0 };
 	}
 
-	uint64_t cpuBeginTime = GetCpuTimestamp();
-	VkSubmitInfo submitInfo = {};
-	submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-	submitInfo.commandBufferCount = 1;
-	submitInfo.pCommandBuffers = &queue.cmdBuffer;
-	result = vkQueueSubmit(queue.queue, 1, &submitInfo, GFence);
-	if (result != VK_SUCCESS)
-	{
-		LogStdErr("vkQueueSubmit failed\n");
-		return { -1.0f, 0 };
-	}
-
-	result = vkWaitForFences(GVkDevice, 1, &GFence, VK_TRUE, ~0llu);
-	if (result != VK_SUCCESS)
-	{
-		LogStdErr("vkWaitForFences failed\n");
-		return { -1.0f, 0 };
-	}
-
-	uint64_t cpuEndTime = GetCpuTimestamp();
-	return { (cpuEndTime - cpuBeginTime) * GInvPerfFrequency, bufferCopy.size };
+	double time = SubmitAndMeasureTime(queue);
+	return { time, dstBuffer.size };
 }
 
 
-static std::tuple<double, VkDeviceSize> Copy(const Buffer& dstBuffer, const Buffer& srcBuffer, VkDeviceSize size)
+static std::tuple<double, VkDeviceSize> Copy(const Buffer& dstBuffer, const Buffer& srcBuffer)
 {
 	uint8_t* dst = (uint8_t*)dstBuffer.mappedAddr;
 	uint8_t* src = (uint8_t*)srcBuffer.mappedAddr;
+	VkDeviceSize size = dstBuffer.size;
 	if (dstBuffer.buffer == srcBuffer.buffer)
 	{
 		dst += size / 2;
@@ -468,6 +562,15 @@ static std::tuple<double, VkDeviceSize> Copy(const Buffer& dstBuffer, const Buff
 	memcpy(dst, src, size);
 	uint64_t cpuEndTime = GetCpuTimestamp();
 	return { (cpuEndTime - cpuBeginTime) * GInvPerfFrequency, size };
+}
+
+
+static std::tuple<double, VkDeviceSize> Fill(const Buffer& dstBuffer)
+{
+	uint64_t cpuBeginTime = GetCpuTimestamp();
+	memset(dstBuffer.mappedAddr, 0, dstBuffer.size);
+	uint64_t cpuEndTime = GetCpuTimestamp();
+	return { (cpuEndTime - cpuBeginTime) * GInvPerfFrequency, dstBuffer.size };
 }
 
 
@@ -504,7 +607,7 @@ int main()
 
 	for (const Queue& queue : GQueues)
 	{
-		LogStdOut("vkCmdCopyBuffer on %s queue:\n", kQueueTypeStr[queue.type]);
+		LogStdOut("vkCmdCopyBuffer on %s queue%s:\n", kQueueTypeStr[queue.type], queue.supportTimestamps ? "" : "(inaccurate)");
 		for (auto& srcBufferIter : buffers)
 		{
 			const uint32_t srcMemIndex = srcBufferIter.first;
@@ -522,7 +625,7 @@ int main()
 				for (uint32_t i = 0; i < kNumOfMeasurements; i++)
 				{
 					double time = 0.0;
-					std::tie(time, sizeCopied) = Copy(queue, dstBuffer, srcBuffer, bufSize);
+					std::tie(time, sizeCopied) = Copy(queue, dstBuffer, srcBuffer);
 					if (time < 0.0f)
 						return -1;
 
@@ -567,7 +670,7 @@ int main()
 			for (uint32_t i = 0; i < kNumOfMeasurements; i++)
 			{
 				double time = 0.0;
-				std::tie(time, sizeCopied) = Copy(dstBuffer, srcBuffer, bufSize);
+				std::tie(time, sizeCopied) = Copy(dstBuffer, srcBuffer);
 				if (time < 0.0f)
 					return -1;
 
@@ -586,6 +689,79 @@ int main()
 			LogStdOut("    Median:  %.2fms %.2fmb/s\n", medianTime * 1000.0f, ComputeSpeed(sizeCopied, medianTime));
 			LogStdOut("    Max:     %.2fms %.2fmb/s\n", maxTime * 1000.0f, ComputeSpeed(sizeCopied, maxTime));
 		}
+	}
+
+	for (const Queue& queue : GQueues)
+	{
+		LogStdOut("vkCmdFillBuffer on %s queue%s:\n", kQueueTypeStr[queue.type], queue.supportTimestamps ? "" : "(inaccurate)");
+		for (auto& dstBufferIter : buffers)
+		{
+			const uint32_t dstMemIndex = dstBufferIter.first;
+			const Buffer& dstBuffer = dstBufferIter.second;
+
+			double measurements[kNumOfMeasurements] = {};
+			double minTime = FLT_MAX;
+			double maxTime = -FLT_MAX;
+			double averageTime = 0.0f;
+			VkDeviceSize sizeCopied = 0;
+			for (uint32_t i = 0; i < kNumOfMeasurements; i++)
+			{
+				double time = 0.0;
+				std::tie(time, sizeCopied) = Fill(queue, dstBuffer);
+				if (time < 0.0f)
+					return -1;
+
+				minTime = std::min(minTime, time);
+				maxTime = std::max(maxTime, time);
+				averageTime += time;
+				measurements[i] = time;
+			}
+			averageTime /= kNumOfMeasurements;
+			std::sort(measurements, measurements + kNumOfMeasurements);
+			double medianTime = measurements[kNumOfMeasurements / 2];
+
+			LogStdOut("  %u:\n", dstMemIndex);
+			LogStdOut("    Min:     %.2fms %.2fmb/s\n", minTime * 1000.0f, ComputeSpeed(sizeCopied, minTime));
+			LogStdOut("    Average: %.2fms %.2fmb/s\n", averageTime * 1000.0f, ComputeSpeed(sizeCopied, averageTime));
+			LogStdOut("    Median:  %.2fms %.2fmb/s\n", medianTime * 1000.0f, ComputeSpeed(sizeCopied, medianTime));
+			LogStdOut("    Max:     %.2fms %.2fmb/s\n", maxTime * 1000.0f, ComputeSpeed(sizeCopied, maxTime));
+		}
+	}
+
+	LogStdOut("memset:\n");
+	for (auto& dstBufferIter : buffers)
+	{
+		const uint32_t dstMemIndex = dstBufferIter.first;
+		const Buffer& dstBuffer = dstBufferIter.second;
+		if (!dstBuffer.mappedAddr)
+			continue;
+
+		double measurements[kNumOfMeasurements] = {};
+		double minTime = FLT_MAX;
+		double maxTime = -FLT_MAX;
+		double averageTime = 0.0f;
+		VkDeviceSize sizeCopied = 0;
+		for (uint32_t i = 0; i < kNumOfMeasurements; i++)
+		{
+			double time = 0.0;
+			std::tie(time, sizeCopied) = Fill(dstBuffer);
+			if (time < 0.0f)
+				return -1;
+
+			minTime = std::min(minTime, time);
+			maxTime = std::max(maxTime, time);
+			averageTime += time;
+			measurements[i] = time;
+		}
+		averageTime /= kNumOfMeasurements;
+		std::sort(measurements, measurements + kNumOfMeasurements);
+		double medianTime = measurements[kNumOfMeasurements / 2];
+
+		LogStdOut("  %u:\n", dstMemIndex);
+		LogStdOut("    Min:     %.2fms %.2fmb/s\n", minTime * 1000.0f, ComputeSpeed(sizeCopied, minTime));
+		LogStdOut("    Average: %.2fms %.2fmb/s\n", averageTime * 1000.0f, ComputeSpeed(sizeCopied, averageTime));
+		LogStdOut("    Median:  %.2fms %.2fmb/s\n", medianTime * 1000.0f, ComputeSpeed(sizeCopied, medianTime));
+		LogStdOut("    Max:     %.2fms %.2fmb/s\n", maxTime * 1000.0f, ComputeSpeed(sizeCopied, maxTime));
 	}
 
     return 0;
