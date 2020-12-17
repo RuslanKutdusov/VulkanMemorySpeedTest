@@ -15,6 +15,8 @@
 struct GpuMemoryProps
 {
 	uint32_t memoryTypeIndex;
+	bool deviceCoherent;
+	bool deviceUncached;
 	bool hostVisible;
 	bool hostCoherent;
 	bool hostCached;
@@ -24,6 +26,8 @@ struct GpuMemoryProps
 struct CpuMemoryProps
 {
 	uint32_t memoryTypeIndex;
+	bool deviceCoherent;
+	bool deviceUncached;
 	bool hostCoherent;
 	bool hostCached;
 };
@@ -60,6 +64,7 @@ struct Buffer
 static VkInstance GVkInstance = VK_NULL_HANDLE;
 static VkPhysicalDevice GVkPhysDevice = VK_NULL_HANDLE;
 static VkDevice GVkDevice = VK_NULL_HANDLE;
+static bool GHasDeviceCoherentMemory = false;
 static int32_t GQueueFamilyIndices[kQueueTypesCount] = {-1, -1, -1};
 static bool GQueueFamilySupportTimestamp[kQueueTypesCount] = {};
 static float GTimestampPeriod = 0.0f;
@@ -151,7 +156,7 @@ static void EnumerateQueues()
 			if ((famityProp.queueFlags & requiredQueueFlags[typeIdx]) == requiredQueueFlags[typeIdx])
 			{
 				GQueueFamilyIndices[typeIdx] = familyIndex;
-				GQueueFamilySupportTimestamp[typeIdx] = famityProp.timestampValidBits != 0 && typeIdx != kQueueTransfer;
+				GQueueFamilySupportTimestamp[typeIdx] = famityProp.timestampValidBits != 0;
 				ResetBit(freeFamiliesMask, familyIndex);
 			}
 		}
@@ -174,29 +179,47 @@ static void EnumerateMemoryTypes()
 	{
 		LogStdOut("Memory type index %u:\n", i);
 		const VkMemoryType& memType = memProps.memoryTypes[i];
+
+		if (!GHasDeviceCoherentMemory && (memType.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD) != 0)
+			continue;
+
 		if (memType.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
 		{
 			GpuMemoryProps props;
 			props.memoryTypeIndex = i;
+			props.deviceCoherent = memType.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD;
+			props.deviceUncached = memType.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD;
 			props.hostVisible = memType.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
 			props.hostCoherent = memType.propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 			props.hostCached = memType.propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
 			GGpuMemory.push_back(props);
-			LogStdOut("  Type:          GPU(device)\n");
-			LogStdOut("  Host visible:  %s\n", props.hostVisible ? "true" : "false");
-			LogStdOut("  Host coherent: %s\n", props.hostCoherent ? "true" : "false");
-			LogStdOut("  Host cached:   %s\n", props.hostCached ? "true" : "false");
+			LogStdOut("  Type:            GPU(device)\n");
+			if (GHasDeviceCoherentMemory)
+			{
+				LogStdOut("  Device coherent: %s\n", props.deviceCoherent ? "true" : "false");
+				LogStdOut("  Device cached:   %s\n", props.deviceUncached ? "true" : "false");
+			}
+			LogStdOut("  Host visible:    %s\n", props.hostVisible ? "true" : "false");
+			LogStdOut("  Host coherent:   %s\n", props.hostCoherent ? "true" : "false");
+			LogStdOut("  Host cached:     %s\n", props.hostCached ? "true" : "false");
 		}
 		else if (memType.propertyFlags != 0)
 		{
 			CpuMemoryProps props;
 			props.memoryTypeIndex = i;
+			props.deviceCoherent = memType.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD;
+			props.deviceUncached = memType.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD;
 			props.hostCoherent = memType.propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 			props.hostCached = memType.propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
 			GCpuMemory.push_back(props);
-			LogStdOut("  Type:          CPU(host)\n");
-			LogStdOut("  Host coherent: %s\n", props.hostCoherent ? "true" : "false");
-			LogStdOut("  Host cached:   %s\n", props.hostCached ? "true" : "false");
+			LogStdOut("  Type:            CPU(host)\n");
+			if (GHasDeviceCoherentMemory)
+			{
+				LogStdOut("  Device coherent: %s\n", props.deviceCoherent ? "true" : "false");
+				LogStdOut("  Device cached:   %s\n", props.deviceUncached ? "true" : "false");
+			}
+			LogStdOut("  Host coherent:   %s\n", props.hostCoherent ? "true" : "false");
+			LogStdOut("  Host cached:     %s\n", props.hostCached ? "true" : "false");
 		}
 	}
 }
@@ -287,6 +310,16 @@ static bool InitVulkan()
 	vkGetPhysicalDeviceProperties(GVkPhysDevice, &physDeviceProps);
 	GTimestampPeriod = physDeviceProps.limits.timestampPeriod;
 
+	VkPhysicalDeviceCoherentMemoryFeaturesAMD deviceCoherentFeature = {};
+	deviceCoherentFeature.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COHERENT_MEMORY_FEATURES_AMD;
+
+	VkPhysicalDeviceFeatures2 features = {};
+	features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+	features.pNext = &deviceCoherentFeature;
+	vkGetPhysicalDeviceFeatures2(GVkPhysDevice, &features);
+
+	GHasDeviceCoherentMemory = deviceCoherentFeature.deviceCoherentMemory;
+
 	EnumerateQueues();
 
 	std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
@@ -305,6 +338,8 @@ static bool InitVulkan()
 	VkDeviceCreateInfo deviceCreateInfo = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
 	deviceCreateInfo.queueCreateInfoCount = (uint32_t)queueCreateInfos.size();
 	deviceCreateInfo.pQueueCreateInfos = queueCreateInfos.data();
+	if (GHasDeviceCoherentMemory)
+		deviceCreateInfo.pNext = &deviceCoherentFeature;
 	if (vkCreateDevice(GVkPhysDevice, &deviceCreateInfo, 0, &GVkDevice) != VK_SUCCESS)
 	{
 		LogStdErr("vkCreateDevice failed\n");
@@ -466,6 +501,64 @@ static double SubmitAndMeasureTime(const Queue& queue)
 }
 
 
+static bool ResetQueryPool(const Queue& queue)
+{
+	if (queue.type == kQueueTransfer)
+	{
+		const Queue& gfxQueue = GQueues[kQueueGfx];
+
+		VkCommandBufferBeginInfo beginInfo = {};
+		beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+		beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+		VkResult result = vkBeginCommandBuffer(gfxQueue.cmdBuffer, &beginInfo);
+		if (result != VK_SUCCESS)
+		{
+			LogStdErr("vkBeginCommandBuffer failed\n");
+			return false;
+		}
+
+		vkCmdResetQueryPool(gfxQueue.cmdBuffer, GQueryPool, 0, 2);
+
+		result = vkEndCommandBuffer(gfxQueue.cmdBuffer);
+		if (result != VK_SUCCESS)
+		{
+			LogStdErr("vkEndCommandBuffer failed\n");
+			return false;
+		}
+
+		result = vkResetFences(GVkDevice, 1, &GFence);
+		if (result != VK_SUCCESS)
+		{
+			LogStdErr("vkResetFences failed\n");
+			return false;
+		}
+
+		VkSubmitInfo submitInfo = {};
+		submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+		submitInfo.commandBufferCount = 1;
+		submitInfo.pCommandBuffers = &gfxQueue.cmdBuffer;
+		result = vkQueueSubmit(gfxQueue.queue, 1, &submitInfo, GFence);
+		if (result != VK_SUCCESS)
+		{
+			LogStdErr("vkQueueSubmit failed\n");
+			return false;
+		}
+
+		result = vkWaitForFences(GVkDevice, 1, &GFence, VK_TRUE, ~0llu);
+		if (result != VK_SUCCESS)
+		{
+			LogStdErr("vkWaitForFences failed\n");
+			return false;
+		}
+	}
+	else
+	{
+		vkCmdResetQueryPool(queue.cmdBuffer, GQueryPool, 0, 2);
+	}
+	return true;
+}
+
+
 static std::tuple<double, VkDeviceSize> Copy(const Queue& queue, const Buffer& dstBuffer, const Buffer& srcBuffer)
 {
 	VkBufferCopy bufferCopy = {};
@@ -491,7 +584,8 @@ static std::tuple<double, VkDeviceSize> Copy(const Queue& queue, const Buffer& d
 
 	if (queue.supportTimestamps)
 	{
-		vkCmdResetQueryPool(queue.cmdBuffer, GQueryPool, 0, 2);
+		if (!ResetQueryPool(queue))
+			return { -1.0f, 0 };
 		vkCmdWriteTimestamp(queue.cmdBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, GQueryPool, 0);
 	}
 
@@ -526,7 +620,7 @@ static std::tuple<double, VkDeviceSize> Fill(const Queue& queue, const Buffer& d
 
 	if (queue.supportTimestamps)
 	{
-		vkCmdResetQueryPool(queue.cmdBuffer, GQueryPool, 0, 2);
+		ResetQueryPool(queue);
 		vkCmdWriteTimestamp(queue.cmdBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, GQueryPool, 0);
 	}
 
