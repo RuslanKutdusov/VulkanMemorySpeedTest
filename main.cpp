@@ -4,8 +4,11 @@
 #include <vulkan/vk_platform.h>
 #include <vulkan/vulkan_core.h>
 #include <vulkan/vulkan.h>
+#ifdef _WIN64 
 #define NOMINMAX
 #include <windows.h>
+#endif
+#include <float.h>
 #include <vector>
 #include <optional>
 #include <map>
@@ -77,32 +80,36 @@ static double GInvPerfFrequency = 0.0f;
 static const char* kQueueTypeStr[] = { "Graphics", "Compute", "Transfer" };
 
 
-inline void LogStdOut(const char* format, ...)
+static void LogStdOut(const char* format, ...)
 {
 	char buf[2048];
 	va_list args;
 	va_start(args, format);
-	int len = vsprintf_s(buf, format, args);
+	int len = vsprintf(buf, format, args);
 	va_end(args);
 	fwrite(buf, 1, len, stdout);
+#ifdef _WIN64
 	OutputDebugStringA(buf);
+#endif
 }
 
 
-inline void LogStdErr(const char* format, ...)
+static void LogStdErr(const char* format, ...)
 {
 	char buf[2048];
 	va_list args;
 	va_start(args, format);
-	int len = vsprintf_s(buf, format, args);
+	int len = vsprintf(buf, format, args);
 	va_end(args);
 	fwrite(buf, 1, len, stderr);
+#ifdef _WIN64
 	OutputDebugStringA(buf);
+#endif
 }
 
 
 template <class T>
-inline T SetBit(T& mask, uint32_t bitIndex)
+static T SetBit(T& mask, uint32_t bitIndex)
 {
 	mask |= static_cast<T>(1) << bitIndex;
 	return mask;
@@ -110,7 +117,7 @@ inline T SetBit(T& mask, uint32_t bitIndex)
 
 
 template <class T>
-inline T ResetBit(T& mask, uint32_t bitIndex)
+static T ResetBit(T& mask, uint32_t bitIndex)
 {
 	mask &= ~(static_cast<T>(1) << bitIndex);
 	return mask;
@@ -118,7 +125,7 @@ inline T ResetBit(T& mask, uint32_t bitIndex)
 
 
 template <class T>
-inline T ToggleBit(T& mask, uint32_t bitIndex)
+static T ToggleBit(T& mask, uint32_t bitIndex)
 {
 	mask ^= static_cast<T>(1) << bitIndex;
 	return mask;
@@ -126,10 +133,13 @@ inline T ToggleBit(T& mask, uint32_t bitIndex)
 
 
 template <class T>
-inline bool TestBit(const T& mask, uint32_t bitIndex)
+static bool TestBit(const T& mask, uint32_t bitIndex)
 {
 	return mask & (static_cast<T>(1) << bitIndex);
 }
+
+
+#define Countof(array) (sizeof(array)/sizeof(array[0]))
 
 
 static void EnumerateQueues()
@@ -289,7 +299,7 @@ static bool InitVulkan()
 	};
 
 	createInfo.ppEnabledExtensionNames = instanceExtensions;
-	createInfo.enabledExtensionCount = _countof(instanceExtensions);
+	createInfo.enabledExtensionCount = Countof(instanceExtensions);
 
 	if (vkCreateInstance(&createInfo, 0, &GVkInstance) != VK_SUCCESS)
 	{
@@ -366,9 +376,14 @@ static bool InitVulkan()
 		return {};
 	}
 
+#ifdef _WIN64
 	LARGE_INTEGER frequency;
 	QueryPerformanceFrequency(&frequency);
 	GInvPerfFrequency = 1.0 / frequency.QuadPart;
+#elif __linux__
+	// TODO
+	GInvPerfFrequency = 0.0;
+#endif
 
 	VkQueryPoolCreateInfo queryPoolCreateInfo = {};
 	queryPoolCreateInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
@@ -444,9 +459,15 @@ static std::optional<Buffer> CreateBuffer(VkDeviceSize size, uint32_t memTypeInd
 
 static uint64_t GetCpuTimestamp()
 {
+#ifdef _WIN64
 	LARGE_INTEGER count;
 	QueryPerformanceCounter(&count);
 	return count.QuadPart;
+#elif __linux__
+	return __rdtsc();
+#else
+	return 0;
+#endif
 }
 
 
