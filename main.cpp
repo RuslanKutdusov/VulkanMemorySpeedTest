@@ -708,7 +708,7 @@ int main()
 	{
 		std::optional<Buffer> buf = CreateBuffer(bufSize, gpuMem.memoryTypeIndex, gpuMem.hostVisible);
 		if (!buf.has_value())
-			return -1;
+			continue;
 		buffers[gpuMem.memoryTypeIndex] = *buf;
 	}
 
@@ -716,7 +716,7 @@ int main()
 	{
 		std::optional<Buffer> buf = CreateBuffer(bufSize, cpuMem.memoryTypeIndex, true);
 		if (!buf.has_value())
-			return -1;
+			continue;
 		buffers[cpuMem.memoryTypeIndex] = *buf;
 	}
 
