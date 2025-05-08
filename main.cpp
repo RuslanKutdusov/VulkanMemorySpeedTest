@@ -320,6 +320,8 @@ static bool InitVulkan()
 	vkGetPhysicalDeviceProperties(GVkPhysDevice, &physDeviceProps);
 	GTimestampPeriod = physDeviceProps.limits.timestampPeriod;
 
+	LogStdOut("Device: %s\n", physDeviceProps.deviceName);
+
 	VkPhysicalDeviceCoherentMemoryFeaturesAMD deviceCoherentFeature = {};
 	deviceCoherentFeature.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COHERENT_MEMORY_FEATURES_AMD;
 
